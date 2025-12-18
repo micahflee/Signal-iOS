@@ -926,6 +926,7 @@ public final class MessageReceiver {
         }
 
         var message: TSIncomingMessage?
+        var shouldSendDeliveryReceipt = true
         if dataMessage.flags & UInt32(SSKProtoDataMessageFlags.endSession.rawValue) != 0 {
             handleIncomingEndSessionEnvelope(envelope, withDataMessage: dataMessage, tx: tx)
         } else if dataMessage.flags & UInt32(SSKProtoDataMessageFlags.expirationTimerUpdate.rawValue) != 0 {
@@ -933,11 +934,13 @@ public final class MessageReceiver {
         } else if dataMessage.flags & UInt32(SSKProtoDataMessageFlags.profileKeyUpdate.rawValue) != 0 {
             // Do nothing, we handle profile keys on all incoming messages above.
         } else {
-            message = processFlaglessDataMessage(dataMessage, request: request, thread: thread, tx: tx)
+            let result = processFlaglessDataMessage(dataMessage, request: request, thread: thread, tx: tx)
+            message = result.message
+            shouldSendDeliveryReceipt = result.shouldSendDeliveryReceipt
         }
 
         // Send delivery receipts for "valid data" messages received via UD.
-        if request.wasReceivedByUD {
+        if request.wasReceivedByUD && shouldSendDeliveryReceipt {
             let receiptSender = SSKEnvironment.shared.receiptSenderRef
             receiptSender.enqueueDeliveryReceipt(for: envelope, messageUniqueId: message?.uniqueId, tx: tx)
         }
@@ -1016,12 +1019,17 @@ public final class MessageReceiver {
         return groupThread
     }
 
+    private struct FlaglessDataMessageResult {
+        let message: TSIncomingMessage?
+        let shouldSendDeliveryReceipt: Bool
+    }
+
     private func processFlaglessDataMessage(
         _ dataMessage: SSKProtoDataMessage,
         request: MessageReceiverRequest,
         thread: TSThread,
         tx: DBWriteTransaction
-    ) -> TSIncomingMessage? {
+    ) -> FlaglessDataMessageResult {
         let envelope = request.decryptedEnvelope
 
         guard !dataMessage.hasRequiredProtocolVersion || dataMessage.requiredProtocolVersion <= SSKProtos.currentProtocolVersion else {
@@ -1032,7 +1040,7 @@ public final class MessageReceiver {
                 sender: SignalServiceAddress(envelope.sourceAci),
                 protocolVersion: UInt(dataMessage.requiredProtocolVersion)
             ).anyInsert(transaction: tx)
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         let deviceAddress = "\(envelope.sourceAci).\(envelope.sourceDeviceId)"
@@ -1059,6 +1067,8 @@ public final class MessageReceiver {
             case .success, .invalidReaction:
                 break
             case .associatedMessageMissing:
+                // Suppress delivery receipt for reactions to non-existent messages
+                Logger.info("Suppressing delivery receipt for reaction to non-existent message from \(envelope.sourceAci)")
                 SSKEnvironment.shared.earlyMessageManagerRef.recordEarlyEnvelope(
                     envelope.envelope,
                     plainTextData: request.plaintextData,
@@ -1071,8 +1081,9 @@ public final class MessageReceiver {
                     ),
                     transaction: tx
                 )
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: false)
             }
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         if let delete = dataMessage.delete {
@@ -1088,7 +1099,10 @@ public final class MessageReceiver {
                 break
             case .invalidDelete:
                 Logger.warn("Couldn't process invalid remote delete w/ts \(delete.targetSentTimestamp)")
+                break
             case .deletedMessageMissing:
+                // Suppress delivery receipt for deletes of non-existent messages
+                Logger.info("Suppressing delivery receipt for delete of non-existent message from \(envelope.sourceAci)")
                 SSKEnvironment.shared.earlyMessageManagerRef.recordEarlyEnvelope(
                     envelope.envelope,
                     plainTextData: request.plaintextData,
@@ -1098,8 +1112,9 @@ public final class MessageReceiver {
                     associatedMessageAuthor: envelope.sourceAci,
                     transaction: tx
                 )
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: false)
             }
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         if let pollVote = dataMessage.pollVote {
@@ -1129,11 +1144,11 @@ public final class MessageReceiver {
                 }
             } catch {
                 owsFailDebug("Could not insert poll vote!")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
 
             // Don't store PollVote as a message.
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         if request.shouldDiscardVisibleMessages {
@@ -1141,13 +1156,13 @@ public final class MessageReceiver {
             // only possible outcome of further processing is a visible message or
             // group call update, both of which should be discarded.
             Logger.info("Discarding message w/ts \(envelope.timestamp)")
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         if let groupCallUpdate = dataMessage.groupCallUpdate {
             guard let groupId = try? (thread as? TSGroupThread)?.groupIdentifier else {
                 Logger.warn("Ignoring group call update invalid group thread.")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
             let pendingTask = Self.buildPendingTask()
             Task { [callMessageHandler] in
@@ -1158,7 +1173,7 @@ public final class MessageReceiver {
                     serverReceivedTimestamp: envelope.timestamp
                 )
             }
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         // TODO: ideally, messages with bodies >OWSMediaUtils.kOversizeTextMessageSizeThresholdBytes
@@ -1166,7 +1181,7 @@ public final class MessageReceiver {
         // into oversized text attachments.
         guard dataMessage.body?.utf8.count ?? 0 <= OWSMediaUtils.kOversizeTextMessageSizeThresholdBytes else {
             Logger.error("Dropping message with too large body: \(dataMessage.body?.utf8.count ?? 0)")
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         let bodyRanges = dataMessage.bodyRanges.isEmpty ? MessageBodyRanges.empty : MessageBodyRanges(protos: dataMessage.bodyRanges)
@@ -1193,7 +1208,7 @@ public final class MessageReceiver {
                 )
             } catch {
                 Logger.error("contact share error: \(error)")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
         } else {
             contactBuilder = nil
@@ -1219,7 +1234,7 @@ public final class MessageReceiver {
                 }
             } catch {
                 Logger.error("linkPreviewError: \(error)")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
         } else {
             linkPreviewBuilder = nil
@@ -1234,7 +1249,7 @@ public final class MessageReceiver {
                 )
             } catch {
                 Logger.error("stickerError: \(error)")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
         } else {
             messageStickerBuilder = nil
@@ -1258,7 +1273,7 @@ public final class MessageReceiver {
             case .activated:
                 SSKEnvironment.shared.paymentsHelperRef.processIncomingPaymentsActivatedMessage(thread: thread, senderAci: envelope.sourceAci, transaction: tx)
             }
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         updateDisappearingMessageConfiguration(envelope: envelope, dataMessage: dataMessage, thread: thread, tx: tx)
@@ -1271,7 +1286,7 @@ public final class MessageReceiver {
             Logger.info("Processing storyContext for message w/ts \(envelope.timestamp), storyTimestamp: \(String(describing: storyTimestamp)), authorAci: \(String(describing: storyAuthorAci))")
             guard let storyAuthorAci else {
                 owsFailDebug("Discarding story reply with invalid ACI")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
 
             if thread.isGroupThread {
@@ -1282,7 +1297,7 @@ public final class MessageReceiver {
                     transaction: tx
                 ) != nil else {
                     Logger.warn("Couldn't find story message; discarding group story reply")
-                    return nil
+                    return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
                 }
             }
         }
@@ -1290,7 +1305,7 @@ public final class MessageReceiver {
         if dataMessage.pollCreate != nil || dataMessage.pollTerminate != nil || dataMessage.pollVote != nil {
             guard RemoteConfig.current.pollReceive else {
                 Logger.warn("Polls not supported on this device")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
         }
 
@@ -1302,14 +1317,14 @@ public final class MessageReceiver {
                     tx: tx)
             } catch {
                 Logger.error("Error validating incoming poll create: \(error)")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
         }
 
         if let pollTerminate = dataMessage.pollTerminate{
             guard let groupThread = thread as? TSGroupThread else {
                 Logger.error("Poll terminate sent to thread that is not a group thread")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
 
             do {
@@ -1353,11 +1368,11 @@ public final class MessageReceiver {
                 }
             } catch {
                 owsFailDebug("Could not terminate poll!")
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
 
             // Don't store poll terminate as a message.
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         if BuildFlags.PinnedMessages.receive,
@@ -1377,10 +1392,10 @@ public final class MessageReceiver {
 
                     SSKEnvironment.shared.databaseStorageRef.touch(interaction: targetMessage, shouldReindex: false, tx: tx)
 
-                    return nil
+                    return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
                 } catch {
                     owsFailDebug("Could not pin message \(error)")
-                    return nil
+                    return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
                 }
             }
 
@@ -1393,10 +1408,10 @@ public final class MessageReceiver {
 
                     SSKEnvironment.shared.databaseStorageRef.touch(interaction: targetMessage, shouldReindex: false, tx: tx)
 
-                    return nil
+                    return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
                 } catch {
                     owsFailDebug("Could not unpin message \(error)")
-                    return nil
+                    return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
                 }
             }
         }
@@ -1438,7 +1453,7 @@ public final class MessageReceiver {
 
         guard message.shouldBeSaved else {
             owsFailDebug("We should be able to save all incoming messages.")
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         let hasRenderableContent = messageBuilder.hasRenderableContent(
@@ -1452,12 +1467,12 @@ public final class MessageReceiver {
         )
         guard hasRenderableContent else {
             Logger.warn("Ignoring empty: \(messageDescription)")
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         if message.giftBadge != nil, thread.isGroupThread {
             owsFailDebug("Ignoring gift sent to group.")
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         // Check for any placeholders inserted because of a previously
@@ -1530,7 +1545,7 @@ public final class MessageReceiver {
             owsFailDebug("Could not build attachments!")
             DependenciesBridge.shared.interactionDeleteManager
                 .delete(message, sideEffects: .default(), tx: tx)
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         if let pollCreate = dataMessage.pollCreate,
@@ -1545,7 +1560,7 @@ public final class MessageReceiver {
                 owsFailDebug("Could not insert poll!")
                 DependenciesBridge.shared.interactionDeleteManager
                     .delete(message, sideEffects: .default(), tx: tx)
-                return nil
+                return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
             }
         }
 
@@ -1553,7 +1568,7 @@ public final class MessageReceiver {
 
         guard let localIdentifiers = DependenciesBridge.shared.tsAccountManager.localIdentifiers(tx: tx) else {
             owsFailDebug("Can't process messages when not registered.")
-            return nil
+            return FlaglessDataMessageResult(message: nil, shouldSendDeliveryReceipt: true)
         }
 
         SSKEnvironment.shared.earlyMessageManagerRef.applyPendingMessages(for: message, localIdentifiers: localIdentifiers, transaction: tx)
@@ -1587,7 +1602,7 @@ public final class MessageReceiver {
             }
         }
 
-        return nil
+        return FlaglessDataMessageResult(message: message, shouldSendDeliveryReceipt: true)
     }
 
     private func updateDisappearingMessageConfiguration(
